@@ -8,7 +8,7 @@ import { observeNativeUi } from "./NativeUiObservation.js";
 import { LldbCallTracer, type NativeCallTracer } from "./LldbCallTracer.js";
 import { observeNativeCalls } from "./NativeCallObservation.js";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
-import { open, realpath, stat } from "node:fs/promises";
+import { realpath, stat, type FileHandle } from "node:fs/promises";
 
 import { z } from "zod";
 
@@ -89,6 +89,13 @@ import {
 import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
 import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
+import {
+  artifactFileCancellationCause,
+  artifactFilePrimaryFailure,
+  bindArtifactFileCleanup,
+  withArtifactRegularFile,
+} from "../artifacts/ArtifactFileOperation.js";
+import { NonRegularFileReadError } from "../filesystem/RegularFile.js";
 import type { PrivateRuntimeRoot } from "../process/PrivateRuntimeRoot.js";
 import {
   createNativeUiHelperRuntime,
@@ -145,6 +152,7 @@ class NativeMacOSClient implements AnalysisClient {
   readonly #pendingNativeUiRuntimes = new Set<NativeUiHelperRuntime>();
   readonly #pendingCommands = new Set<Promise<unknown>>();
   readonly #signatureResources = new ArtifactResourceScope();
+  readonly #plistResources = new ArtifactResourceScope();
   #nativeUiTail: Promise<void> = Promise.resolve();
   #closed = false;
 
@@ -292,21 +300,14 @@ class NativeMacOSClient implements AnalysisClient {
     const uiCleanupFailures = await this.#serializeNativeUi(() =>
       this.#retryNativeUiCleanup(),
     );
-    let signatureCleanup: AnalysisError | undefined;
-    try {
-      await this.#signatureResources.close();
-    } catch (cause: unknown) {
-      const observation = ArtifactReaderFailure.cleanupObservation(
-        cause,
-        "signature-snapshot",
-      );
-      signatureCleanup = new ProviderCleanupError(
-        IDENTITY.id,
-        observation.resources,
-        { reason: observation.reason },
-        { operation: "close_binary", cause },
-      );
-    }
+    const signatureCleanup = await closeResourceScope(
+      this.#signatureResources,
+      "signature-snapshot",
+    );
+    const plistCleanup = await closeResourceScope(
+      this.#plistResources,
+      "plist",
+    );
     const commandCleanup = await this.#retryNativeCommandCleanup();
     let result = await this.tracer.close();
     const cleanupErrors = [
@@ -315,6 +316,7 @@ class NativeMacOSClient implements AnalysisClient {
         : [this.#nativeUiCleanupFailure(uiCleanupFailures, "close_binary")]),
       ...(commandCleanup === undefined ? [] : [commandCleanup]),
       ...(signatureCleanup === undefined ? [] : [signatureCleanup]),
+      ...(plistCleanup === undefined ? [] : [plistCleanup]),
     ];
     for (const cleanupError of cleanupErrors)
       result = result.ok
@@ -771,7 +773,8 @@ class NativeMacOSClient implements AnalysisClient {
       );
     const plist = await resolvePlistPath(this.target, requested);
     if (!plist.ok) return plist;
-    const selected = await requireRegularPlist(plist.value, requested);
+    const file = { resources: this.#plistResources, signal };
+    const selected = await requireRegularPlist(plist.value, requested, file);
     if (!selected.ok) return selected;
     const classified = await this.#run(
       "inspect_plist",
@@ -826,6 +829,7 @@ class NativeMacOSClient implements AnalysisClient {
       classified.value.stdout,
       plist.value,
       requested,
+      file,
     );
     if (!format.ok) return format;
     const result = inspectPlistSchema.parse({
@@ -1189,76 +1193,132 @@ const plistSourceFormat = async (
   description: string,
   path: string,
   requested: string | undefined,
+  file: PlistFileOwner,
 ): Promise<Result<"binary" | "xml" | "json" | "unknown", AnalysisError>> => {
   if (/binary property list/iu.test(description)) return ok("binary");
   if (/\bXML\b/iu.test(description)) return ok("xml");
   if (/\bJSON\b/iu.test(description)) return ok("json");
   if (!/\btext\b/iu.test(description)) return ok("unknown");
-  try {
-    const handle = await open(path, "r");
-    try {
-      const head = Buffer.alloc(PLIST_MARKUP_PROBE_BYTES);
-      const { bytesRead } = await handle.read(head, 0, head.length, 0);
-      const encoding =
-        head[0] === 0xff && head[1] === 0xfe
-          ? "utf-16le"
-          : head[0] === 0xfe && head[1] === 0xff
-            ? "utf-16be"
-            : "utf-8";
-      const text = new TextDecoder(encoding)
-        .decode(head.subarray(0, bytesRead))
-        .trimStart();
-      return ok(
-        /^<(?:[!?]|(?:plist|dict|array|string|integer|real|data|date|true|false)[\s/>])/u.test(
-          text,
-        )
-          ? "xml"
-          : "unknown",
-      );
-    } finally {
-      await handle.close();
-    }
-  } catch (cause: unknown) {
-    const code =
-      cause instanceof Error && "code" in cause ? cause.code : undefined;
-    if (code === "ENOENT" || code === "ENOTDIR")
-      return err(unreadablePlist(path, requested, "no file exists there"));
-    return err(
-      new ProviderAdapterError(IDENTITY.id, "inspect_plist", { cause }),
-    );
-  }
+  return withPlistFile(path, requested, file, async (handle) => {
+    const head = Buffer.alloc(PLIST_MARKUP_PROBE_BYTES);
+    const { bytesRead } = await handle.read(head, 0, head.length, 0);
+    const encoding =
+      head[0] === 0xff && head[1] === 0xfe
+        ? "utf-16le"
+        : head[0] === 0xfe && head[1] === 0xff
+          ? "utf-16be"
+          : "utf-8";
+    const text = new TextDecoder(encoding)
+      .decode(head.subarray(0, bytesRead))
+      .trimStart();
+    return /^<(?:[!?]|(?:plist|dict|array|string|integer|real|data|date|true|false)[\s/>])/u.test(
+      text,
+    )
+      ? "xml"
+      : "unknown";
+  });
 };
 
 /**
  * Admit a readable regular file before plutil runs, so a later plutil failure
  * reflects the bytes rather than a missing path or a host permission denial.
+ * Opening also observes ACL and macOS privacy denials that stat permits.
  */
-const requireRegularPlist = async (
+const requireRegularPlist = (
   path: string,
   requested: string | undefined,
-): Promise<Result<null, AnalysisError>> => {
+  file: PlistFileOwner,
+): Promise<Result<null, AnalysisError>> =>
+  withPlistFile(path, requested, file, () => Promise.resolve(null));
+
+/** The client scope that keeps a failed plist close owned until it is retried. */
+interface PlistFileOwner {
+  readonly resources: ArtifactResourceScope;
+  readonly signal: AbortSignal | undefined;
+}
+
+/** Own one plist descriptor from admission through its operation and final close. */
+const withPlistFile = async <Value>(
+  path: string,
+  requested: string | undefined,
+  { resources, signal }: PlistFileOwner,
+  operation: (handle: FileHandle) => Promise<Value>,
+): Promise<Result<Value, AnalysisError>> => {
   try {
-    if (!(await stat(path)).isFile())
-      return err(unreadablePlist(path, requested, "it is not a regular file"));
-    // Opening also observes ACL and macOS privacy denials that stat permits.
-    await (await open(path, "r")).close();
-    return ok(null);
-  } catch (cause: unknown) {
-    const code =
-      cause instanceof Error && "code" in cause ? cause.code : undefined;
-    if (code === "ENOENT" || code === "ENOTDIR")
-      return err(unreadablePlist(path, requested, "no file exists there"));
-    if (code === "EACCES" || code === "EPERM")
-      return err(
-        new BinaryTargetError(
-          path,
-          `permission denied while reading plist (${code})`,
-          { cause },
-        ),
-      );
-    return err(
-      new ProviderAdapterError(IDENTITY.id, "inspect_plist", { cause }),
+    return ok(
+      await resources.run(() =>
+        withArtifactRegularFile(path, resources, signal, operation, "follow"),
+      ),
     );
+  } catch (cause: unknown) {
+    return err(plistFileFailure(cause, path, requested));
+  }
+};
+
+/** Project one owned plist file outcome, keeping a failed close beside the physical failure. */
+const plistFileFailure = (
+  cause: unknown,
+  path: string,
+  requested: string | undefined,
+): AnalysisError => {
+  const physical = artifactFilePrimaryFailure(cause);
+  const code =
+    physical instanceof Error && "code" in physical ? physical.code : undefined;
+  const primary =
+    physical instanceof ArtifactReaderFailure && physical.reason === "cancelled"
+      ? new AnalysisCancelledError("inspect_plist", {
+          cause: artifactFileCancellationCause(physical),
+        })
+      : physical instanceof NonRegularFileReadError
+        ? unreadablePlist(path, requested, "it is not a regular file")
+        : code === "ENOENT" || code === "ENOTDIR"
+          ? unreadablePlist(path, requested, "no file exists there")
+          : code === "EACCES" || code === "EPERM"
+            ? new BinaryTargetError(
+                path,
+                `permission denied while reading plist (${code})`,
+                { cause: physical },
+              )
+            : new ProviderAdapterError(IDENTITY.id, "inspect_plist", {
+                cause: physical,
+              });
+  if (!(cause instanceof ArtifactReaderFailure) || cause.cleanup === undefined)
+    return primary;
+  const error = analysisErrorWithCleanupFailure(
+    primary,
+    new ProviderCleanupError(
+      IDENTITY.id,
+      cause.cleanup.resources,
+      { reason: cause.cleanup.reason },
+      { operation: "inspect_plist", cause },
+    ),
+    "inspect_plist",
+  );
+  bindArtifactFileCleanup(cause, error);
+  return error;
+};
+
+/** Retry one scope's retained owners at client close, bound to their exact leases. */
+const closeResourceScope = async (
+  resources: ArtifactResourceScope,
+  fallbackResource: string,
+): Promise<AnalysisError | undefined> => {
+  try {
+    await resources.close();
+    return undefined;
+  } catch (cause: unknown) {
+    const observation = ArtifactReaderFailure.cleanupObservation(
+      cause,
+      fallbackResource,
+    );
+    const error = new ProviderCleanupError(
+      IDENTITY.id,
+      observation.resources,
+      { reason: observation.reason },
+      { operation: "close_binary", cause },
+    );
+    bindArtifactFileCleanup(cause, error);
+    return error;
   }
 };
 
