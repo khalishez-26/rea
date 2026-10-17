@@ -128,6 +128,129 @@ process.stdout.write(JSON.stringify({ snapshot, default_popup_decision: defaultP
 })();
 `;
 
+const removalStatesSource = `const { EventEmitter } = require("node:events");
+const { ipcMain } = require("electron");
+const outcomes = {};
+const compare = (name, scenario) => {
+  outcomes[name] = { plain: scenario(new EventEmitter()), hooked: scenario(ipcMain) };
+};
+compare("recorded-invocation-then-direct-removal", (emitter) => {
+  const calls = [];
+  const listener = () => calls.push("call");
+  emitter.on("ch", listener);
+  emitter.emit("ch", {});
+  emitter.removeListener("ch", listener);
+  emitter.emit("ch", {});
+  return { calls: calls.length, remaining: emitter.listenerCount("ch") };
+});
+compare("no-observer-mutated-remove-all", (emitter) => {
+  const listener = () => {};
+  emitter.on("ch", listener);
+  emitter.rawListeners("ch")[0].listener = () => {};
+  emitter.removeAllListeners("ch");
+  const second = () => {};
+  emitter.on("ch2", second);
+  emitter.removeAllListeners();
+  return {
+    ch: emitter.listenerCount("ch"),
+    ch2: emitter.listenerCount("ch2"),
+    eventNames: emitter.eventNames().length,
+  };
+});
+compare("decorator-unmutated-metadata", (emitter) => {
+  const listener = () => {};
+  const nativeRemove = emitter.removeListener;
+  const seen = [];
+  emitter.on("removeListener", () => {});
+  emitter.on("ch", listener);
+  emitter.removeListener = function (channel, candidate) {
+    if (channel === "ch") seen.push(candidate === listener);
+    return Reflect.apply(nativeRemove, this, arguments);
+  };
+  emitter.removeAllListeners("ch");
+  emitter.removeListener = nativeRemove;
+  return { seen, remaining: emitter.listenerCount("ch") };
+});
+compare("meta-listener-only-mutated-metadata", (emitter) => {
+  let removals = 0;
+  const listener = () => {};
+  emitter.on("removeListener", () => { removals += 1; });
+  emitter.on("ch", listener);
+  emitter.rawListeners("ch")[0].listener = () => {};
+  emitter.removeAllListeners("ch");
+  return { removals, remaining: emitter.listenerCount("ch") };
+});
+compare("decorator-multiple-lifo", (emitter) => {
+  const first = () => {};
+  const second = () => {};
+  const nativeRemove = emitter.removeListener;
+  const seen = [];
+  emitter.on("removeListener", () => {});
+  emitter.on("ch", first);
+  emitter.on("ch", second);
+  emitter.rawListeners("ch")[0].listener = () => {};
+  emitter.removeListener = function (channel, candidate) {
+    if (channel === "ch")
+      seen.push(candidate === first ? "first" : candidate === second ? "second" : "other");
+    return Reflect.apply(nativeRemove, this, arguments);
+  };
+  emitter.removeAllListeners("ch");
+  emitter.removeListener = nativeRemove;
+  return { seen, remaining: emitter.listenerCount("ch") };
+});
+compare("accessor-metadata", (emitter) => {
+  const listener = () => {};
+  const nativeRemove = emitter.removeListener;
+  let getterRuns = 0;
+  const seen = [];
+  emitter.on("removeListener", () => {});
+  emitter.on("ch", listener);
+  Object.defineProperty(emitter.rawListeners("ch")[0], "listener", {
+    configurable: true,
+    get() { getterRuns += 1; return listener; },
+  });
+  emitter.removeListener = function (channel, candidate) {
+    seen.push(candidate === listener);
+    return Reflect.apply(nativeRemove, this, arguments);
+  };
+  emitter.removeAllListeners("ch");
+  emitter.removeListener = nativeRemove;
+  return { seen, remaining: emitter.listenerCount("ch"), getterRuns };
+});
+compare("decorator-throws-then-retry", (emitter) => {
+  const listener = () => {};
+  const nativeRemove = emitter.removeListener;
+  let failing = true;
+  let failure = null;
+  emitter.on("removeListener", () => {});
+  emitter.on("ch", listener);
+  emitter.removeListener = function (channel, candidate) {
+    if (channel === "ch" && failing) throw new Error("app removal rejected");
+    return Reflect.apply(nativeRemove, this, arguments);
+  };
+  try { emitter.removeAllListeners("ch"); } catch (cause) { failure = cause.message; }
+  failing = false;
+  emitter.removeAllListeners("ch");
+  emitter.removeListener = nativeRemove;
+  return { failure, remaining: emitter.listenerCount("ch") };
+});
+compare("remove-all-channels", (emitter) => {
+  const listener = () => {};
+  emitter.on("removeListener", () => {});
+  emitter.on("ch", listener);
+  emitter.on("other", listener);
+  emitter.rawListeners("ch")[0].listener = () => {};
+  emitter.removeAllListeners();
+  return {
+    ch: emitter.listenerCount("ch"),
+    other: emitter.listenerCount("other"),
+    meta: emitter.listenerCount("removeListener"),
+  };
+});
+const snapshot = globalThis.__reaElectronActiveSnapshot();
+process.stdout.write(JSON.stringify({ outcomes, hook_error: snapshot.hook_error }) + "\\n");
+`;
+
 afterEach(async () => {
   await Promise.all(
     temporary
@@ -1833,6 +1956,293 @@ process.stdout.write(JSON.stringify({
     hook_error: false,
     window_open_handler: "function",
   });
+});
+
+it("removes observed ipcMain listeners by their original function through mutated raw-listener metadata", async () => {
+  const root = await createTestTempDirectory("rea-electron-hook-removal-");
+  temporary.push(root);
+  await writeElectronFixture(root);
+  const script = join(root, "canonical-removal.cjs");
+  await writeFile(
+    script,
+    `const { EventEmitter } = require("node:events");
+const { ipcMain } = require("electron");
+const scenario = (emitter) => {
+  const listener = () => {};
+  const nativeRemove = emitter.removeListener;
+  let failure = null;
+  const seen = [];
+  emitter.on("removeListener", () => {});
+  emitter.on("ch", listener);
+  emitter.rawListeners("ch")[0].listener = () => {};
+  emitter.removeListener = function (channel, candidate) {
+    if (channel === "ch") {
+      seen.push(candidate === listener);
+      if (candidate !== listener) throw new Error("unexpected callback");
+    }
+    return Reflect.apply(nativeRemove, this, arguments);
+  };
+  try { emitter.removeAllListeners("ch"); } catch (cause) { failure = cause.message; }
+  return { seen, remaining: emitter.listenerCount("ch"), failure };
+};
+process.stdout.write(JSON.stringify({
+  plain: scenario(new EventEmitter()),
+  hooked: scenario(ipcMain),
+  hook_error: globalThis.__reaElectronActiveSnapshot().hook_error,
+}) + "\\n");
+`,
+  );
+  const execution = await runNode(script, root);
+  expect(execution.code, execution.stderr).toBe(0);
+  const result = JSON.parse(
+    execution.stdout.trim().split("\n").at(-1) ?? "null",
+  ) as {
+    readonly plain: {
+      readonly seen: readonly boolean[];
+      readonly remaining: number;
+      readonly failure: string | null;
+    };
+    readonly hooked: {
+      readonly seen: readonly boolean[];
+      readonly remaining: number;
+      readonly failure: string | null;
+    };
+    readonly hook_error: boolean;
+  };
+  expect(result.hook_error).toBe(false);
+  // A plain EventEmitter hands the registered callback itself to the
+  // application's removal decorator and completes the removal.
+  expect(result.plain).toEqual({
+    seen: [true],
+    remaining: 0,
+    failure: null,
+  });
+  // The hook must preserve that contract even though it registered a
+  // recording wrapper and the application mutated its raw-listener metadata.
+  expect(result.hooked).toEqual(result.plain);
+});
+
+it("completes observed ipcMain listener removal across decorators and metadata states", async () => {
+  const root = await createTestTempDirectory(
+    "rea-electron-hook-removal-states-",
+  );
+  temporary.push(root);
+  await writeElectronFixture(root);
+  const script = join(root, "removal-states.cjs");
+  await writeFile(script, removalStatesSource);
+  const execution = await runNode(script, root);
+  expect(execution.code, execution.stderr).toBe(0);
+  const result = JSON.parse(
+    execution.stdout.trim().split("\n").at(-1) ?? "null",
+  ) as {
+    readonly outcomes: Record<
+      string,
+      { readonly plain: unknown; readonly hooked: unknown }
+    >;
+    readonly hook_error: boolean;
+  };
+  expect(result.hook_error).toBe(false);
+  expect(Object.keys(result.outcomes)).toHaveLength(8);
+  for (const [name, outcome] of Object.entries(result.outcomes)) {
+    if (name === "accessor-metadata") continue;
+    expect(outcome.hooked, name).toEqual(outcome.plain);
+  }
+  expect(
+    result.outcomes["recorded-invocation-then-direct-removal"]?.plain,
+  ).toEqual({ calls: 1, remaining: 0 });
+  expect(result.outcomes["decorator-multiple-lifo"]?.plain).toEqual({
+    seen: ["second", "first"],
+    remaining: 0,
+  });
+  expect(result.outcomes["decorator-throws-then-retry"]?.plain).toEqual({
+    failure: "app removal rejected",
+    remaining: 0,
+  });
+  // Accessor metadata stays untranslated — the conservative contract
+  // anchored by "preserves native removal before mutated raw listener
+  // metadata throws": the decorator observes the recording wrapper while
+  // the application's own native removal still executes the accessor
+  // exactly once, matching plain's read count and completing removal.
+  const accessor = result.outcomes["accessor-metadata"] as {
+    readonly plain: {
+      readonly seen: readonly boolean[];
+      readonly remaining: number;
+      readonly getterRuns: number;
+    };
+    readonly hooked: {
+      readonly seen: readonly boolean[];
+      readonly remaining: number;
+      readonly getterRuns: number;
+    };
+  };
+  expect(accessor.plain).toEqual({ seen: [true], remaining: 0, getterRuns: 1 });
+  expect(accessor.hooked).toEqual({
+    seen: [false],
+    remaining: 0,
+    getterRuns: accessor.plain.getterRuns,
+  });
+});
+
+it("removes one registration per removal request for duplicated ipcMain listeners with mutated metadata", async () => {
+  const root = await createTestTempDirectory(
+    "rea-electron-hook-removal-duplicate-",
+  );
+  temporary.push(root);
+  await writeElectronFixture(root);
+  const script = join(root, "removal-duplicate.cjs");
+  await writeFile(
+    script,
+    `const { EventEmitter } = require("node:events");
+const { ipcMain } = require("electron");
+// The same callback registered twice; the LAST raw entry's metadata is
+// mutated. One removal request must remove exactly one registration, even
+// when a decorator rejects later requests.
+const rejection = (emitter) => {
+  const listener = () => {};
+  const nativeRemove = emitter.removeListener;
+  const seen = [];
+  let count = 0;
+  let failure = null;
+  emitter.on("removeListener", () => {});
+  emitter.on("ch", listener);
+  emitter.on("ch", listener);
+  emitter.rawListeners("ch")[1].listener = () => {};
+  emitter.removeListener = function (channel, candidate) {
+    if (channel === "ch") {
+      count += 1;
+      seen.push(candidate === listener);
+      if (count > 1) throw new Error("second removal rejected");
+    }
+    return Reflect.apply(nativeRemove, this, arguments);
+  };
+  try { emitter.removeAllListeners("ch"); } catch (cause) { failure = cause.message; }
+  emitter.removeListener = nativeRemove;
+  return { seen, remaining: emitter.listenerCount("ch"), failure };
+};
+const forwarding = (emitter) => {
+  const listener = () => {};
+  const nativeRemove = emitter.removeListener;
+  const seen = [];
+  emitter.on("removeListener", () => {});
+  emitter.on("second", listener);
+  emitter.on("second", listener);
+  emitter.rawListeners("second")[1].listener = () => {};
+  emitter.removeListener = function (channel, candidate) {
+    if (channel === "second") seen.push(candidate === listener);
+    return Reflect.apply(nativeRemove, this, arguments);
+  };
+  emitter.removeAllListeners("second");
+  emitter.removeListener = nativeRemove;
+  return { seen, remaining: emitter.listenerCount("second") };
+};
+process.stdout.write(JSON.stringify({
+  rejection: { plain: rejection(new EventEmitter()), hooked: rejection(ipcMain) },
+  forwarding: { plain: forwarding(new EventEmitter()), hooked: forwarding(ipcMain) },
+  hook_error: globalThis.__reaElectronActiveSnapshot().hook_error,
+}) + "\\n");
+`,
+  );
+  const execution = await runNode(script, root);
+  expect(execution.code, execution.stderr).toBe(0);
+  const result = JSON.parse(
+    execution.stdout.trim().split("\n").at(-1) ?? "null",
+  ) as {
+    readonly rejection: {
+      readonly plain: {
+        readonly seen: readonly boolean[];
+        readonly remaining: number;
+        readonly failure: string | null;
+      };
+      readonly hooked: {
+        readonly seen: readonly boolean[];
+        readonly remaining: number;
+        readonly failure: string | null;
+      };
+    };
+    readonly forwarding: {
+      readonly plain: {
+        readonly seen: readonly boolean[];
+        readonly remaining: number;
+      };
+      readonly hooked: {
+        readonly seen: readonly boolean[];
+        readonly remaining: number;
+      };
+    };
+    readonly hook_error: boolean;
+  };
+  expect(result.hook_error).toBe(false);
+  // A plain EventEmitter forwards the original callback to the decorator on
+  // each traversal step, and a rejected second removal keeps one listener.
+  expect(result.rejection.plain).toEqual({
+    seen: [true, true],
+    remaining: 1,
+    failure: "second removal rejected",
+  });
+  expect(result.rejection.hooked).toEqual(result.rejection.plain);
+  expect(result.forwarding.plain).toEqual({ seen: [true, true], remaining: 0 });
+  expect(result.forwarding.hooked).toEqual(result.forwarding.plain);
+});
+
+it("keeps an ipcMain wrapper restored by a removeListener observer during completion", async () => {
+  const root = await createTestTempDirectory(
+    "rea-electron-hook-removal-restore-",
+  );
+  temporary.push(root);
+  await writeElectronFixture(root);
+  const script = join(root, "removal-restore.cjs");
+  await writeFile(
+    script,
+    `const { EventEmitter } = require("node:events");
+const { ipcMain } = require("electron");
+// An observer saves the raw listener entry and re-registers it once a
+// removal is announced. The restored registration is deliberate and must
+// survive, with exactly one removal notification.
+const scenario = (emitter) => {
+  const listener = () => {};
+  emitter.on("ch", listener);
+  const saved = emitter.rawListeners("ch")[0];
+  const notifications = [];
+  let restored = false;
+  emitter.on("removeListener", (channel, observed) => {
+    if (channel !== "ch") return;
+    notifications.push(observed === listener);
+    if (!restored) { restored = true; emitter.on("ch", saved); }
+  });
+  emitter.removeAllListeners("ch");
+  const remaining = emitter.listenerCount("ch");
+  emitter.emit("ch", { sender: { id: 9 } });
+  return { notifications, remaining };
+};
+process.stdout.write(JSON.stringify({
+  plain: scenario(new EventEmitter()),
+  hooked: scenario(ipcMain),
+  hook_error: globalThis.__reaElectronActiveSnapshot().hook_error,
+}) + "\\n");
+`,
+  );
+  const execution = await runNode(script, root);
+  expect(execution.code, execution.stderr).toBe(0);
+  const result = JSON.parse(
+    execution.stdout.trim().split("\n").at(-1) ?? "null",
+  ) as {
+    readonly plain: {
+      readonly notifications: readonly boolean[];
+      readonly remaining: number;
+    };
+    readonly hooked: {
+      readonly notifications: readonly boolean[];
+      readonly remaining: number;
+    };
+    readonly hook_error: boolean;
+  };
+  expect(result.hook_error).toBe(false);
+  // A plain EventEmitter announces one removal and keeps the restored
+  // registration.
+  expect(result.plain).toEqual({ notifications: [true], remaining: 1 });
+  // The hook must not delete the restored wrapper through its completion
+  // fallback, nor announce a second removal for it.
+  expect(result.hooked).toEqual(result.plain);
 });
 
 it("preserves fatal process termination after recording uncaught exceptions", async () => {
